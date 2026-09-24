@@ -57,20 +57,23 @@ class RegistrationEngine:
         max_shift: Optional[float] = None,
         use_laplacian: bool = True,
         unwrap_aliasing: bool = True,
+        min_fallback_response: Optional[float] = None,
     ):
         """
         Args:
             min_response (float): Minimum correlation response required for valid=True. Default: 0.05.
             min_spatial_score (float): Minimum spatial cross-correlation required for valid=True. Default: 0.50.
-            max_shift (Optional[float]): Maximum allowed shift distance in pixels.
+            max_shift (Optional[float]): Maximum allowed shift distance in pixels. Default: None (unlimited).
             use_laplacian (bool): Whether to apply Laplacian edge whitening during preprocessing.
             unwrap_aliasing (bool): Whether to unwrap FFT periodic shift ambiguity (> W/2 or H/2).
+            min_fallback_response (Optional[float]): Minimum phase correlation response required for strip fallback. Defaults to min_response.
         """
         self.min_response = min_response
         self.min_spatial_score = min_spatial_score
         self.max_shift = max_shift
         self.use_laplacian = use_laplacian
         self.unwrap_aliasing = unwrap_aliasing
+        self.min_fallback_response = min_fallback_response if min_fallback_response is not None else min_response
 
     def register(self, ref_frame: np.ndarray, curr_frame: np.ndarray) -> RegistrationResult:
         """Registers curr_frame relative to ref_frame and evaluates registration quality.
@@ -199,7 +202,7 @@ class RegistrationEngine:
                 global_dx_offset=float(w - strip_w),
                 global_dy_offset=0.0,
             )
-            if r_result is not None and r_result.spatial_score > best_score:
+            if r_result is not None and r_result.valid and r_result.spatial_score > best_score:
                 best_score = r_result.spatial_score
                 best_result = r_result
 
@@ -212,7 +215,7 @@ class RegistrationEngine:
                 global_dx_offset=-float(w - strip_w),
                 global_dy_offset=0.0,
             )
-            if l_result is not None and l_result.spatial_score > best_score:
+            if l_result is not None and l_result.valid and l_result.spatial_score > best_score:
                 best_score = l_result.spatial_score
                 best_result = l_result
 
@@ -276,7 +279,7 @@ class RegistrationEngine:
             )
 
         valid = bool(
-            (response >= self.min_response) and
+            (response >= self.min_fallback_response) and
             (strip_spatial >= self.min_spatial_score) and
             np.isfinite(dx) and np.isfinite(dy)
         )
