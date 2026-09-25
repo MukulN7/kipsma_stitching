@@ -58,6 +58,7 @@ class RegistrationEngine:
         use_laplacian: bool = True,
         unwrap_aliasing: bool = True,
         min_fallback_response: Optional[float] = None,
+        use_sift: bool = False,
     ):
         """
         Args:
@@ -67,6 +68,7 @@ class RegistrationEngine:
             use_laplacian (bool): Whether to apply Laplacian edge whitening during preprocessing.
             unwrap_aliasing (bool): Whether to unwrap FFT periodic shift ambiguity (> W/2 or H/2).
             min_fallback_response (Optional[float]): Minimum phase correlation response required for strip fallback. Defaults to min_response.
+            use_sift (bool): Whether to use SIFT+RANSAC translation as primary registration before phase correlation fallback. Default: True.
         """
         self.min_response = min_response
         self.min_spatial_score = min_spatial_score
@@ -74,12 +76,14 @@ class RegistrationEngine:
         self.use_laplacian = use_laplacian
         self.unwrap_aliasing = unwrap_aliasing
         self.min_fallback_response = min_fallback_response if min_fallback_response is not None else min_response
+        self.use_sift = use_sift
 
     def register(self, ref_frame: np.ndarray, curr_frame: np.ndarray) -> RegistrationResult:
         """Registers curr_frame relative to ref_frame and evaluates registration quality.
 
-        First tries full-frame phase correlation. If that fails the quality gate,
-        falls back to a horizontal-strip overlap search before returning.
+        Uses SIFT feature matching with RANSAC translation as the primary registration
+        method. If SIFT fails validation, falls back to full-frame phase correlation
+        and horizontal strip overlap search.
 
         Args:
             ref_frame (np.ndarray): Reference image frame.
@@ -97,7 +101,102 @@ class RegistrationEngine:
         if ref_frame.size == 0 or curr_frame.size == 0:
             return RegistrationResult(0.0, 0.0, 0.0, False, spatial_score=0.0, quality_score=0.0)
 
-        # Preprocess both frames non-destructively
+        # 1. Primary path: SIFT feature matching + RANSAC translation
+        if self.use_sift:
+            sift_result = self._register_sift(ref_frame, curr_frame)
+            if sift_result.valid:
+                return sift_result
+
+        # 2. Fallback path: Phase correlation (full-frame -> strip fallback)
+        return self._register_phase_correlation(ref_frame, curr_frame)
+
+    def _register_sift(self, ref_frame: np.ndarray, curr_frame: np.ndarray) -> RegistrationResult:
+        """Computes 2D translation via SIFT feature matching and RANSAC affine estimation."""
+        try:
+            gray_ref = self._to_gray_u8(ref_frame)
+            gray_curr = self._to_gray_u8(curr_frame)
+
+            sift = cv2.SIFT_create()
+            kp_ref, des_ref = sift.detectAndCompute(gray_ref, None)
+            kp_curr, des_curr = sift.detectAndCompute(gray_curr, None)
+
+            if des_ref is None or des_curr is None or len(kp_ref) < 6 or len(kp_curr) < 6:
+                return RegistrationResult(0.0, 0.0, 0.0, False, spatial_score=0.0, quality_score=0.0)
+
+            bf = cv2.BFMatcher(cv2.NORM_L2)
+            matches = bf.knnMatch(des_ref, des_curr, k=2)
+
+            good_matches = []
+            for m_n in matches:
+                if len(m_n) == 2:
+                    m, n = m_n
+                    if m.distance < 0.75 * n.distance:
+                        good_matches.append(m)
+
+            if len(good_matches) < 6:
+                return RegistrationResult(0.0, 0.0, 0.0, False, spatial_score=0.0, quality_score=0.0)
+
+            src_pts = np.float32([kp_ref[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+            dst_pts = np.float32([kp_curr[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+
+            matrix, inliers = cv2.estimateAffinePartial2D(
+                src_pts, dst_pts, method=cv2.RANSAC, ransacReprojThreshold=3.0
+            )
+
+            if matrix is None:
+                return RegistrationResult(0.0, 0.0, 0.0, False, spatial_score=0.0, quality_score=0.0)
+
+            a, b = float(matrix[0, 0]), float(matrix[1, 0])
+            scale = float(np.hypot(a, b))
+            angle_deg = float(abs(np.degrees(np.arctan2(b, a))))
+            dx = float(matrix[0, 2])
+            dy = float(matrix[1, 2])
+            shift_dist = float(np.hypot(dx, dy))
+
+            inlier_count = int(np.sum(inliers)) if inliers is not None else 0
+            inlier_ratio = float(inlier_count / len(good_matches))
+
+            # Compute spatial overlap score on raw grayscale frames for metadata
+            r_gray = gray_ref.astype(np.float32)
+            c_gray = gray_curr.astype(np.float32)
+            spatial_score = float(self._compute_spatial_overlap_score(r_gray, c_gray, dx, dy))
+            quality_score = max(0.0, min(1.0, spatial_score))
+
+            valid = bool(
+                (abs(scale - 1.0) <= 0.05) and
+                (angle_deg <= 3.0) and
+                (inlier_count >= 5) and
+                (inlier_ratio >= 0.45) and
+                (inlier_count >= 10 or inlier_ratio >= 0.50) and
+                (self.max_shift is None or shift_dist <= self.max_shift) and
+                np.isfinite(dx) and np.isfinite(dy)
+            )
+
+            return RegistrationResult(
+                dx, dy, float(inlier_ratio), valid,
+                spatial_score=spatial_score, quality_score=quality_score
+            )
+        except Exception:
+            return RegistrationResult(0.0, 0.0, 0.0, False, spatial_score=0.0, quality_score=0.0)
+
+    def _to_gray_u8(self, frame: np.ndarray) -> np.ndarray:
+        """Converts frame to uint8 grayscale non-destructively for SIFT feature extraction."""
+        if frame.ndim == 3:
+            weights = np.array([0.114, 0.587, 0.299], dtype=np.float32)
+            gray = np.dot(frame[..., :3], weights)
+        else:
+            gray = frame
+
+        if gray.dtype == np.uint8:
+            return gray.copy()
+
+        mn, mx = float(gray.min()), float(gray.max())
+        rng = mx - mn if mx != mn else 1.0
+        norm = ((gray.astype(np.float32) - mn) / rng * 255.0)
+        return np.clip(norm, 0, 255).astype(np.uint8)
+
+    def _register_phase_correlation(self, ref_frame: np.ndarray, curr_frame: np.ndarray) -> RegistrationResult:
+        """Phase correlation registration pipeline (full-frame -> strip fallback)."""
         ref_prep = self._preprocess(ref_frame)
         curr_prep = self._preprocess(curr_frame)
 
@@ -371,3 +470,174 @@ class RegistrationEngine:
             norm = np.zeros_like(gray)
 
         return cv2.Laplacian(norm, cv2.CV_32F, ksize=3)
+
+
+class LightGlueRegistrationEngine:
+    """2D Translation Registration Engine based on SuperPoint feature extraction and LightGlue feature matching.
+
+    Uses SuperPoint deep features and LightGlue transformer matching to estimate 2D translation via RANSAC.
+    Validates registration quality against response strength, spatial overlap score, and shift constraints.
+    Exposes an identical registration interface to RegistrationEngine.
+    """
+
+    def __init__(
+        self,
+        min_spatial_score: float = 0.35,
+        max_shift: Optional[float] = 150.0,
+        max_num_keypoints: int = 1024,
+        device: Optional[str] = None,
+    ):
+        """
+        Args:
+            min_spatial_score (float): Minimum spatial cross-correlation required for valid=True. Default: 0.35.
+            max_shift (Optional[float]): Maximum allowed shift distance in pixels. Default: 150.0.
+            max_num_keypoints (int): Maximum keypoints extracted per frame by SuperPoint. Default: 1024.
+            device (Optional[str]): PyTorch device ('cuda' or 'cpu'). Defaults to CUDA if available, else CPU.
+        """
+        self.min_spatial_score = min_spatial_score
+        self.max_shift = max_shift
+        self.max_num_keypoints = max_num_keypoints
+        self._device = device
+        self._extractor = None
+        self._matcher = None
+        self._init_error = None
+
+    @staticmethod
+    def is_available() -> bool:
+        """Returns True if PyTorch and LightGlue dependencies are installed."""
+        try:
+            import torch
+            from lightglue import SuperPoint, LightGlue
+            return True
+        except ImportError:
+            return False
+
+    def _lazy_init(self) -> None:
+        """Lazy-loads PyTorch, SuperPoint, and LightGlue models."""
+        if self._extractor is not None and self._matcher is not None:
+            return
+        if self._init_error is not None:
+            raise self._init_error
+
+        try:
+            import torch
+            from lightglue import SuperPoint, LightGlue
+
+            if self._device is None:
+                self._device = "cuda" if torch.cuda.is_available() else "cpu"
+
+            self._extractor = SuperPoint(max_num_keypoints=self.max_num_keypoints).eval().to(self._device)
+            self._matcher = LightGlue(features="superpoint").eval().to(self._device)
+        except Exception as exc:
+            self._init_error = RuntimeError(
+                "SuperPoint + LightGlue registration unavailable. "
+                "Required dependencies missing or failed to initialize. "
+                "Install with: pip install torch lightglue kornia\n"
+                f"Original error: {exc}"
+            )
+            raise self._init_error
+
+    def register(self, ref_frame: np.ndarray, curr_frame: np.ndarray) -> RegistrationResult:
+        """Registers curr_frame relative to ref_frame using SuperPoint + LightGlue and RANSAC translation.
+
+        Args:
+            ref_frame (np.ndarray): Reference image frame.
+            curr_frame (np.ndarray): Current image frame to align.
+
+        Returns:
+            RegistrationResult: (dx, dy, response, valid, spatial_score, quality_score).
+        """
+        if ref_frame is None or curr_frame is None:
+            return RegistrationResult(0.0, 0.0, 0.0, False, spatial_score=0.0, quality_score=0.0)
+
+        if ref_frame.shape != curr_frame.shape or ref_frame.size == 0 or curr_frame.size == 0:
+            return RegistrationResult(0.0, 0.0, 0.0, False, spatial_score=0.0, quality_score=0.0)
+
+        try:
+            self._lazy_init()
+        except RuntimeError:
+            return RegistrationResult(0.0, 0.0, 0.0, False, spatial_score=0.0, quality_score=0.0)
+
+        try:
+            import torch
+            from lightglue.utils import rbd
+
+            gray_ref = self._to_gray_u8(ref_frame)
+            gray_curr = self._to_gray_u8(curr_frame)
+
+            t_ref = torch.from_numpy(gray_ref).float().unsqueeze(0).unsqueeze(0).to(self._device) / 255.0
+            t_curr = torch.from_numpy(gray_curr).float().unsqueeze(0).unsqueeze(0).to(self._device) / 255.0
+
+            with torch.no_grad():
+                feats_ref = self._extractor.extract(t_ref)
+                feats_curr = self._extractor.extract(t_curr)
+                matches_res = self._matcher({"image0": feats_ref, "image1": feats_curr})
+
+                f_ref, f_curr, m_res = [rbd(x) for x in [feats_ref, feats_curr, matches_res]]
+                matches = m_res["matches"]
+
+            if matches is None or len(matches) < 6:
+                return RegistrationResult(0.0, 0.0, 0.0, False, spatial_score=0.0, quality_score=0.0)
+
+            kpts_ref = f_ref["keypoints"][matches[:, 0]].cpu().numpy()
+            kpts_curr = f_curr["keypoints"][matches[:, 1]].cpu().numpy()
+
+            src_pts = kpts_ref.reshape(-1, 1, 2).astype(np.float32)
+            dst_pts = kpts_curr.reshape(-1, 1, 2).astype(np.float32)
+
+            matrix, inliers = cv2.estimateAffinePartial2D(
+                src_pts, dst_pts, method=cv2.RANSAC, ransacReprojThreshold=3.0
+            )
+
+            if matrix is None:
+                return RegistrationResult(0.0, 0.0, 0.0, False, spatial_score=0.0, quality_score=0.0)
+
+            a, b = float(matrix[0, 0]), float(matrix[1, 0])
+            scale = float(np.hypot(a, b))
+            angle_deg = float(abs(np.degrees(np.arctan2(b, a))))
+            dx = float(matrix[0, 2])
+            dy = float(matrix[1, 2])
+            shift_dist = float(np.hypot(dx, dy))
+
+            inlier_count = int(np.sum(inliers)) if inliers is not None else 0
+            inlier_ratio = float(inlier_count / len(matches)) if len(matches) > 0 else 0.0
+
+            r_gray = gray_ref.astype(np.float32)
+            c_gray = gray_curr.astype(np.float32)
+            spatial_score = float(RegistrationEngine._compute_spatial_overlap_score(r_gray, c_gray, dx, dy))
+            quality_score = max(0.0, min(1.0, spatial_score))
+
+            valid = bool(
+                (abs(scale - 1.0) <= 0.05) and
+                (angle_deg <= 3.0) and
+                (inlier_count >= 10) and
+                (inlier_ratio >= 0.45) and
+                (self.max_shift is None or shift_dist <= self.max_shift) and
+                (spatial_score >= self.min_spatial_score) and
+                np.isfinite(dx) and np.isfinite(dy)
+            )
+
+            return RegistrationResult(
+                dx, dy, float(inlier_ratio), valid,
+                spatial_score=spatial_score, quality_score=quality_score
+            )
+        except Exception:
+            return RegistrationResult(0.0, 0.0, 0.0, False, spatial_score=0.0, quality_score=0.0)
+
+    @staticmethod
+    def _to_gray_u8(frame: np.ndarray) -> np.ndarray:
+        """Converts frame to uint8 grayscale non-destructively for feature extraction."""
+        if frame.ndim == 3:
+            weights = np.array([0.114, 0.587, 0.299], dtype=np.float32)
+            gray = np.dot(frame[..., :3], weights)
+        else:
+            gray = frame
+
+        if gray.dtype == np.uint8:
+            return gray.copy()
+
+        mn, mx = float(gray.min()), float(gray.max())
+        rng = mx - mn if mx != mn else 1.0
+        norm = ((gray.astype(np.float32) - mn) / rng * 255.0)
+        return np.clip(norm, 0, 255).astype(np.uint8)
+

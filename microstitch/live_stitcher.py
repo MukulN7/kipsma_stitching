@@ -142,6 +142,7 @@ class LiveStitcher:
             min_spatial_score=min_spatial,
             max_shift=max_shift,
             use_laplacian=True,
+            use_sift=True,
         )
         self._mosaic = MosaicManager()
         self._renderer = MosaicCanvasRenderer()

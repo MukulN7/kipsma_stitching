@@ -76,7 +76,7 @@ class TestOverlapFallbackSynthetic(unittest.TestCase):
 
     def setUp(self):
         from microstitch.registration import RegistrationEngine
-        self.engine = RegistrationEngine()
+        self.engine = RegistrationEngine(use_sift=False)
 
     def test_horizontal_right_translation_detected(self):
         """curr_frame recorded to the right of ref_frame -> fallback right hypothesis."""
@@ -194,7 +194,7 @@ class TestMISTHorizontalOverlapDiagnostic(unittest.TestCase):
 
     def setUp(self):
         from microstitch.registration import RegistrationEngine
-        self.engine = RegistrationEngine()
+        self.engine = RegistrationEngine(use_sift=False)
 
     def test_mist_pairs_diagnostic(self):
         from microstitch.registration import RegistrationResult
